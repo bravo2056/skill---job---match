@@ -28,25 +28,47 @@ Condensed list only — no links unless user asks:
 
 ### Auto-filter (never surface, log as Pass):
 - PMP as a hard filter (not preferred)
-- Onsite outside commute range (~45 min from [HOME_LOCATION])
-- Comp ceiling under [COMP_FLOOR] — filter only when the ceiling of the posted range is under [COMP_FLOOR]; a low floor alone is not a disqualifier
+- Onsite outside NJ commute range (~45 min from Hillsborough NJ)
+- Comp ceiling under $130K — filter only when the ceiling of the posted range is under $130K; a low floor alone is not a disqualifier
 - Underleveled roles (less than 5 years experience required)
 - Non-target roles: design, sales, developer relations, evangelist, marketing, HR
 - Pure hands-on engineering roles (software dev, network engineer, hardware, manufacturing/chemical process engineering)
 - **Note:** Two valid target tracks exist — evaluate against BOTH before filtering:
   - **Track 1 (PM resume):** TPM, Technical Program Manager, Senior PM, Director of Programs
   - **Track 2 (Automation resume):** Process Engineer, Business Process Analyst, Operations Automation, Workflow Engineer, Systems Operations Manager, Continuous Improvement Manager — roles centered on designing/optimizing operational workflows and automation systems
-- **Placement restrictions (hard stop)** — check config.md for any active placement restrictions. Any role matching a restriction should be flagged and passed regardless of fit. Note the restriction in the verdict; do not surface as a candidate.
+- **Verizon placements (hard stop through 20 Aug 2026)** — severance agreement prohibits
+  working for Verizon until August 20, 2026. Any role where the client is Verizon or likely
+  Verizon should be flagged and passed regardless of fit. Indicators: Basking Ridge NJ,
+  Bedminster NJ, Branchburg NJ addresses, or postings that reference "major telecom client NJ"
+  through a staffing firm. Note the restriction in the verdict; do not surface as a candidate.
 
 ### Surface with a flag (don't auto-filter):
 - Domain gap is "preferred" not "required" — note the gap, still surface
-- Domain outside core background (fintech/payments, healthcare IT, construction, aerospace,
-  consumer hardware/firmware, data center hardware ops, biotech/pharma, real estate/mortgage,
-  advertising/media agency) — surface in Tier 2 or Tier 3 based on score, flag the domain gap
+- All domains proceed to scoring — domain gaps are handled by the 20% Domain Knowledge weight in the rubric, not by filtering. Score determines tier.
 - Remote status unclear — flag it
 - Comp not posted — flag it, still surface if role otherwise fits
 
 After scanning, check the SQLite database (`job-tracker.db`) for any role already logged — query by company + role. Also cross-check reviewed-postings.md as a fallback during Phase 2.
+
+### Staffing Agency Duplicate Detection
+
+When a posting comes from a staffing agency (PEAK, Insight Global, Aditi, TalentBurst, Intelliswift, Kelly, Robert Half, TEKsystems, etc.), extract the underlying employer name from the job description and check that name against the DB separately. Surface the result to the user before scoring:
+
+> **Staffing agency posting detected** — underlying employer appears to be [Employer]. DB check: [match found / no match]. Proceed?
+
+Do not auto-score until the user confirms it is not a duplicate.
+
+## Context Window Management
+
+Email scans are context-heavy. Each email body (especially LinkedIn and ZipRecruiter digests at 90–200KB) consumes a large portion of the context window. To avoid timing out mid-scan:
+
+**Required protocol — run `/compact` between Phase 1 and Phase 2:**
+- **Phase 1:** Read all emails, collect all role data, run DB duplicate checks, surface staffing agency confirmations. Do NOT score yet.
+- **`/compact`** — run this after Phase 1 is complete. This compresses the conversation and frees the context window before the scoring pass begins.
+- **Phase 2:** Score all confirmed roles, deliver Tier 1 / Tier 2 / Tier 3 results, write to DB, log metrics, produce cleanup list.
+
+If the user does not manually run `/compact`, prompt them:
+> "Phase 1 complete — all emails read, [N] roles collected. Run `/compact` now before I start scoring to avoid a context timeout."
 
 ## Post-Scan Inbox Cleanup
 
