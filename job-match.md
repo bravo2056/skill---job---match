@@ -171,9 +171,15 @@ Score categories:
 - **Stretch Match (25–49%)** — Missing key requirements but has transferable strengths. Long shot but not unreasonable.
 - **Poor Match (0–24%)** — Fundamental misalignment. Be direct about this.
 
-**3. Job Parsing** — Break down what the role actually requires:
-- Hard requirements, soft requirements, hidden signals, seniority calibration,
-  compensation signals (as described in Step 1 above)
+**3. Job Parsing** — Use this exact format:
+
+| Met ✅ | Unmet / Risk ⚠️❌ |
+|---|---|
+| [hard req met] | [hard req missing or at risk] |
+
+**Soft reqs:** [comma-separated list]
+**Hidden signals:** [one sentence — what the JD implies but doesn't say outright]
+**Seniority / Comp:** [level calibration] | [comp range or "not posted"] | [Remote/Hybrid/Onsite] | [close date if listed]
 
 ### Step 4: Resume Revision (If Requested)
 
