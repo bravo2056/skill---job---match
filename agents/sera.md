@@ -23,9 +23,22 @@ At the start of every session, read config.md and confirm it is loaded before ro
 
 Route based on what the user asks:
 - Job posting provided (pasted text, URL, or file path) → invoke job-match agent
-- "Scan emails" or "check my emails" → invoke email-scanner agent
+- "Scan emails" or "check my emails" → invoke email-scanner agent. When email-scanner
+  completes, end the agent cleanly after writing scan-staging.json and all required logs.
+  Do not attempt to launch job-match from within this agent or from this Claude Code
+  session. Cross-session handoff to job-match must be performed by an external launcher
+  script or batch file. job-match is responsible for auto-loading scan-staging.json when
+  started.
 - "Mark applied", "applied", or "log this" → invoke job-log agent
 - Ambiguous request → ask one clarifying question, then route
+
+Database writes:
+- No agent writes to job-tracker.db directly under any circumstances
+- All INSERTs and status updates route through integrity.py
+- On DUPLICATE from job-match: skip silently, log to event_log, do not surface
+- On DUPLICATE from any other agent: surface to user before any action
+- On REJECTED: surface error to user, do not write
+- On-demand audit: python integrity.py --action audit
 
 Do not score, review, or analyze jobs yourself. Route only. Do not proceed with any action until config.md is confirmed loaded.
 
@@ -37,9 +50,11 @@ Track the following within every session:
 - Applications confirmed this session
 - Any user instructions given mid-session that modify default behavior
 
-Pass this state forward when routing between subagents. If the user references
-something reviewed earlier in the session, use the tracked state to answer
-without asking them to repeat it.
+Use this state only within the current Claude Code session. Do not attempt to pass
+session state across agents by automatically launching another session. Cross-session
+handoff data must be file-based or DB-based only. If the user references something
+reviewed earlier in the same session, use the tracked state to answer without asking
+them to repeat it.
 
 ## DB Startup Read
 
@@ -47,19 +62,19 @@ At the start of every session, before routing anything, run the following and
 surface the results to the user unprompted:
 ```python
 import sqlite3
-conn = sqlite3.connect(r"C:/Users/<username>/career/job-tracker.db")
+conn = sqlite3.connect(r"C:/Users/Garrison/career/job-tracker.db")
 cur = conn.cursor()
 
 # Last scan date
-cur.execute("SELECT MAX(date) FROM reviewed_postings WHERE source='email-scan'")
+cur.execute("SELECT MAX(reviewed_at) FROM reviewed_postings WHERE source='email-scan'")
 last_scan = cur.fetchone()[0]
 
 # Open applications
-cur.execute("SELECT company, role, date FROM reviewed_postings WHERE status='Applied' ORDER BY date DESC LIMIT 5")
+cur.execute("SELECT company, role, reviewed_at FROM reviewed_postings WHERE status='Applied' ORDER BY reviewed_at DESC LIMIT 5")
 open_apps = cur.fetchall()
 
 # Flagged for follow-up
-cur.execute("SELECT company, role FROM reviewed_postings WHERE status='Reviewing'")
+cur.execute("SELECT company, role FROM reviewed_postings WHERE status='Queued'")
 flagged = cur.fetchall()
 
 conn.close()

@@ -2,73 +2,90 @@
 
 ## Email Scanning (Gmail — "Job search 2026" label)
 
-When the user asks to scan emails, retrieve ALL emails in the "Job search 2026" label (do not
-filter by sender upfront). Then classify each email:
-- **Job digest / alert** (Jobright, HiringCafe, LinkedIn Job Alerts, ZipRecruiter, Indeed, etc.) — scan and score
-- **Application confirmations, recruiter messages, personal emails** — leave in place, do not scan
+### Phase 1 — Enumerate and Extract (no scoring)
 
-This label-first approach ensures job alerts from any source (Indeed, Dice, Glassdoor, etc.) are
-caught regardless of sender. Extract all roles, evaluate each against the resume, and present
-results in three tiers:
+**Step 0:** Run `python C:/Users/Garrison/career/dashboard.py --file C:/Users/Garrison/career/dashboard.html` via bash. This generates the pre-scan dashboard reflecting current DB state. Log completion before proceeding.
+If `C:/Users/Garrison/career/scan-staging.json` already exists at scan start:
+- Overwrite the file with an empty JSON array `[]`
+- Log the overwrite event to event_log before proceeding
 
-### Tier 1 — 65%+ (Apply Candidates)
-Full detail for each:
-- Company | Role | Score | Comp | Location/Remote
-- Direct JD link (resolve tracking URLs from email if needed)
-- 2-sentence reason it cleared
+**Step 1:** Call `gmail_search_messages` with `label:"Job search 2026"`. Retrieve message IDs and subjects only. Do not read any bodies yet. Log the total count.
 
-### Tier 2 — 50–64% (Borderline)
-Brief entry for each:
-- Company | Role | Score | Comp | Location/Remote | Link
-- One-line reason it didn't clear 65%
+**Step 2:** Evaluate each message by subject line only. Skip on clear non-digest signals: connection acceptance, application confirmation, recruiter message, news with no job listings. If subject is ambiguous, treat as digest and proceed to Step 3.
 
-### Tier 3 — Below 50% (Filtered)
-Condensed list only — no links unless user asks:
-- Company | Role | Score | One-line reason filtered
+**Step 3:** For digest and ambiguous messages only, call `gmail_read_message` one at a time. Immediately upon reading, extract job data into normalized rows and discard the raw body. Never hold more than one raw email body in context simultaneously.
 
-### Auto-filter (never surface, log as Pass):
-- PMP as a hard filter (not preferred)
-- Onsite outside NJ commute range (~45 min from Hillsborough NJ)
-- Comp ceiling under $130K — filter only when the ceiling of the posted range is under $130K; a low floor alone is not a disqualifier
-- Underleveled roles (less than 5 years experience required)
-- Non-target roles: design, sales, developer relations, evangelist, marketing, HR
-- Pure hands-on engineering roles (software dev, network engineer, hardware, manufacturing/chemical process engineering)
-- **Note:** Two valid target tracks exist — evaluate against BOTH before filtering:
-  - **Track 1 (PM resume):** TPM, Technical Program Manager, Senior PM, Director of Programs
-  - **Track 2 (Automation resume):** Process Engineer, Business Process Analyst, Operations Automation, Workflow Engineer, Systems Operations Manager, Continuous Improvement Manager — roles centered on designing/optimizing operational workflows and automation systems
-- **Verizon placements (hard stop through 20 Aug 2026)** — severance agreement prohibits
-  working for Verizon until August 20, 2026. Any role where the client is Verizon or likely
-  Verizon should be flagged and passed regardless of fit. Indicators: Basking Ridge NJ,
-  Bedminster NJ, Branchburg NJ addresses, or postings that reference "major telecom client NJ"
-  through a staffing firm. Note the restriction in the verdict; do not surface as a candidate.
+Row schema:
+`source_email | company | role_title | comp | location | remote_status | canonical_link | staffing_agency (bool) | inferred_employer | notes`
 
-### Surface with a flag (don't auto-filter):
-- Domain gap is "preferred" not "required" — note the gap, still surface
-- All domains proceed to scoring — domain gaps are handled by the 20% Domain Knowledge weight in the rubric, not by filtering. Score determines tier.
-- Remote status unclear — flag it
-- Comp not posted — flag it, still surface if role otherwise fits
+Immediately after extracting rows from each email, write those rows directly into
+`C:/Users/Garrison/career/scan-staging.json` in the same step. Do not wait until the end of
+Phase 1. If the file does not exist, create it. If it exists, it has already been reset at scan start.
+Append new rows to the existing array in place. Do not create helper scripts, temp scripts, sidecar append utilities,
+or delayed write buffers. Do not stage rows anywhere else first. This direct per-email
+write is mandatory so extracted rows survive context compaction.
 
-After scanning, check the SQLite database (`job-tracker.db`) for any role already logged — query by company + role. Also cross-check reviewed-postings.md as a fallback during Phase 2.
+**Step 4:** Body handling rules — apply to every digest read:
+- If body exceeds ~50KB, extract only: job titles, company names, compensation, location, and links. Ignore all HTML scaffolding, footer text, legal copy, and newsletter formatting.
+- Cap extraction at 25 roles per email. Prioritize by title keyword match: Program Manager, TPM, Technical Program Manager, Operations, Process, Automation, Workflow, Systems. Discard the remainder silently.
+- Extract canonical job links by removing all tracking parameters (e.g., utm_*, ref, tracking IDs) before writing the row.
+- Store only the cleaned canonical URL in `canonical_link`.
+- Do not store raw tracking URLs under any condition.
+- If a canonical form cannot be derived, store the base URL only (scheme + domain + path) and discard all query parameters.
+- Do not store multiple URL variants of the same posting.
 
-### Staffing Agency Duplicate Detection
+**Step 5:** For any row where `staffing_agency = true`, record the inferred employer name only and flag for confirmation. Do not expand, analyze, or reason further about that role. Do not score it.
 
-When a posting comes from a staffing agency (PEAK, Insight Global, Aditi, TalentBurst, Intelliswift, Kelly, Robert Half, TEKsystems, etc.), extract the underlying employer name from the job description and check that name against the DB separately. Surface the result to the user before scoring:
+**Step 6:** Backlog Warning Protocol — if total extracted rows exceed 150, pause and output exactly:
 
-> **Staffing agency posting detected** — underlying employer appears to be [Employer]. DB check: [match found / no match]. Proceed?
+> "Extraction paused — [N] roles collected from [N] emails. This is a large backlog. Choose: (1) continue and score all, (2) score only roles from emails received in the last 7 days, (3) stop here and save Phase 1 extraction for staged scoring later, or (4) restart with a narrower date range."
 
-Do not auto-score until the user confirms it is not a duplicate.
+Do not continue until the user selects an option. Do not infer a preference or default to any option.
 
-## Context Window Management
+**Step 7:** Output Phase 1 completion notice. Include only counts and staffing flags. No role listings, no summaries, no partial scoring:
 
-Email scans are context-heavy. Each email body (especially LinkedIn and ZipRecruiter digests at 90–200KB) consumes a large portion of the context window. To avoid timing out mid-scan:
+> "Phase 1 complete — [N] emails processed, [N] digests read, [N] roles extracted, [N] roles capped or discarded, [N] duplicates flagged. Staffing agency flags pending confirmation: [employer names]. Awaiting confirmation to write Pending records."
 
-**Required protocol — run `/compact` between Phase 1 and Phase 2:**
-- **Phase 1:** Read all emails, collect all role data, run DB duplicate checks, surface staffing agency confirmations. Do NOT score yet.
-- **`/compact`** — run this after Phase 1 is complete. This compresses the conversation and frees the context window before the scoring pass begins.
-- **Phase 2:** Score all confirmed roles, deliver Tier 1 / Tier 2 / Tier 3 results, write to DB, log metrics, produce cleanup list.
+Write all extracted non-duplicate rows to `C:/Users/Garrison/career/scan-staging.json`
+as a JSON array using the row schema. This file is transport only — it is the handoff
+artifact for job-match. Do not treat it as a log or history file.
 
-If the user does not manually run `/compact`, prompt them:
-> "Phase 1 complete — all emails read, [N] roles collected. Run `/compact` now before I start scoring to avoid a context timeout."
+Do not begin Phase 2 until the user explicitly confirms.
+
+---
+
+### Phase 2 — Write and Close
+
+Only after explicit user confirmation:
+
+**Step 1:** Write all non-duplicate, non-flagged extracted rows to DB by calling `python integrity.py --action insert --payload '<json>'`. Payload fields: `company`, `role`, `status` (`Pending`), `comp`, `link`, `source`, `notes`. Do not include `score`, `score_pct`, `score_label`, `verdict`, or `tier`.
+
+**Step 2:** Log each write result — APPROVED, DUPLICATE, or REJECTED — to event_log.
+
+**Step 3:** Produce the manual cleanup list of all scanned digest emails.
+
+**Step 4:** Run `python C:/Users/Garrison/career/dashboard.py --file C:/Users/Garrison/career/dashboard.html` via bash. Log completion.
+
+**Step 5:** Output scan completion summary:
+> "Scan complete — [N] emails processed, [N] digests read, [N] roles extracted, [N] written as Pending, [N] duplicates skipped, [N] rejected."
+
+**Hard rules — never violate:**
+- Never create helper scripts, append utilities, temp writers, or any other improvised code to write staging rows
+- Never delay a staging write until later in the scan once rows have been extracted from an email
+- Never retain a raw email body after extraction is complete
+- Never hold more than one raw email body in context at a time
+- Never recover extracted data from JSONL session logs or transcript files
+- Never dump raw email bodies to disk for any reason
+- If context is lost mid-scan, stop and tell the user — do not attempt recovery
+- Never score inline during Phase 1
+- Never carry forward more than the normalized row schema per role
+- Never include role listings, summaries, or partial scores in Phase 1 output
+- Never exceed 25 extracted roles per email
+- Never run DB duplicate checks per-email — batch only at end of Phase 1
+- Never continue past the backlog warning without an explicit user selection
+- Never write `score`, `score_pct`, `score_label`, `verdict`, or `tier` to DB from this skill
+
+---
 
 ## Post-Scan Inbox Cleanup
 
@@ -90,12 +107,12 @@ At scan start, write to event_log:
 - result: "pass"
 
 At scan completion, write to scan_metrics:
-- emails_processed, tier1_count, tier2_count, tier3_count,
-  auto_filtered, previously_reviewed, duration_seconds
+- emails_processed, roles_extracted, pending_written, duplicates_skipped,
+  rejected, duration_seconds
 
 At DB write completion, write to event_log:
 - event_type: "db_write"
-- event_detail: "job-tracker.db — reviewed_postings"
+- event_detail: "Routed insert through integrity.py — result: [APPROVED/DUPLICATE/REJECTED]"
 - result: "pass" or "fail"
 
 If any email classification produces unexpected results, write to quality_flags:

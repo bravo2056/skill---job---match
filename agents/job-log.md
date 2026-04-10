@@ -2,13 +2,13 @@
 
 ## Job Search Log
 
-The user maintains a [STATE] Unemployment Insurance work search log at:
-`C:/Users/<username>/career/job-search-log.csv`
+The user maintains a NJ Unemployment Insurance work search log at:
+`C:/Users/Garrison/career/job-search-log.csv`
 
-**When an application is confirmed** (user says "applied", "mark applied", or similar), immediately add an entry to the CSV — no permission prompt needed. This log must always be kept current. Columns to write:
+**When an application is confirmed** (user says "applied", "mark applied", or similar), immediately add an entry to the CSV — no permission prompt needed. This log is legally required for NJ UI compliance and must always be kept current. Columns to write:
 - Week Starting (Sunday of the certification week)
 - Date of Contact
-- Time of Contact (timestamp required — use format 10:00 AM)
+- Time of Contact (timestamp required for audit compliance — use format 10:00 AM)
 - Employer Name
 - Address / URL
 - Phone (use email if no phone available)

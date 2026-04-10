@@ -6,48 +6,69 @@
 - Resume (PM/TPM): `C:/Users/Garrison/career/resume-att-pm.md` (primary)
 - Resume (Automation): `C:/Users/Garrison/career/resume-automation.md`
 - LinkedIn profile: `C:/Users/Garrison/career/linkedin.md`
-- Job search log: `C:/Users/Garrison/career/job-search-log.csv`
-- Reviewed postings log: `C:/Users/Garrison/career/reviewed-postings.md`
+- Scan staging file: `C:/Users/Garrison/career/scan-staging.json` (transport only)
 
-Read both resumes, the LinkedIn profile, and the reviewed postings log at the start of
-every review. If any file is missing, tell the user and ask them to paste the content
-so you can save it there.
+Start by checking for the staging file at:
+`C:/Users/Garrison/career/scan-staging.json`
+
+If the file exists:
+- Load all rows from this file immediately
+- Do not request pasted input
+- Do not wait for user interaction
+- Treat this as the primary input source for the session
+
+If the file does not exist:
+- Then and only then request manual input or pasted roles
+
+If invoked with `--input manual`:
+- Ignore the staging file even if it exists
+- Proceed with manual input mode
+
+Under no condition should this agent idle waiting for input if the staging file is present and no manual override was specified.
+
+**Hard rules — never violate:**
+- Never prompt for pasted input if `scan-staging.json` exists and no `--input manual` override is provided
+- Never ignore or bypass the staging file when it is present unless explicitly overridden
+
+Read both resumes, the LinkedIn profile, and the scan staging file (if present) at the
+start of every review session. If any required file is missing, tell the user.
 
 ## Database (Phase 2 — parallel writes active)
 
 Primary database: `C:/Users/Garrison/career/job-tracker.db` (SQLite)
-Backup flat file: `C:/Users/Garrison/career/reviewed-postings.md` (read-only backup, keep in sync)
 
-**Before delivering a review**, check for a matching company + role by running:
-```python
-import sqlite3
-conn = sqlite3.connect(r"C:/Users/Garrison/career/job-tracker.db")
-cur = conn.cursor()
-cur.execute("SELECT date, score, verdict, status FROM reviewed_postings WHERE company=? AND role=?", (company, role))
-row = cur.fetchone()
-conn.close()
-```
-If a match is found, flag it immediately: "This posting looks like one reviewed on [date] — verdict was [verdict]. Want to re-review or skip it?"
+**Legacy output prohibition — never violate:**
+The file `reviewed-postings.md` is retired and must not be used for any reason.
+Do not write, append, log, or persist any job data to this file.
+Do not create replacement markdown logs or local tracking files.
+All persistence must go through `job-tracker.db` via `integrity.py`.
 
-**After every review**, write to BOTH the database AND the markdown file:
+**DB write enforcement — never violate:**
+All writes to `job-tracker.db` must go through:
+`python C:/Users/Garrison/career/integrity.py --action ... --payload '<json>'`
 
-Database insert:
-```python
-import sqlite3
-conn = sqlite3.connect(r"C:/Users/Garrison/career/job-tracker.db")
-cur = conn.cursor()
-cur.execute("""
-    INSERT INTO reviewed_postings (date, company, role, score, score_pct, verdict, status, comp, remote, link, notes)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-""", (date, company, role, score_label, score_int, verdict, status, comp, remote, link, notes))
-conn.commit()
-conn.close()
-```
+Do not open `job-tracker.db` directly.
+Do not write raw SQL.
+Do not import `sqlite3` for write operations.
+Do not create helper scripts, temp scripts, or one-off Python files to perform DB writes.
 
-Markdown append (same as before — append a row to reviewed-postings.md):
-`| date | company | role | score | verdict |`
+If `integrity.py` does not support the required action, stop and surface the limitation.
+Do not work around it under any condition.
 
-Status values: `Pending` | `Applied` | `Borderline` | `Pass` | `Reviewing`
+After every review, write score_pct via:
+`python integrity.py --action update_score --payload '{"id": <id>, "score_pct": <score>}'`
+Do not write `score_label`, `tier`, or `verdict` — these are derived and never stored.
+
+**Before writing**, call `python integrity.py --action insert --payload '<json>'`.
+Do not run a manual SQL dedup check. If result is DUPLICATE:
+- If existing record status is `Pending`, transition via `integrity.py --action update_status` — do not prompt the user.
+- If existing record status is anything other than `Pending`, skip silently and log the duplicate to event_log. Do not surface to user, do not write.
+
+**After every review**, submit payload to integrity.py. Default status on review write is `Reviewed`. If the record already exists in DB with status `Pending` (ingested by email-scanner), call `integrity.py --action update_status` to transition `Pending → Reviewed` rather than inserting a duplicate. Matching must use normalized company and role (case-insensitive, trimmed). If no exact match is found, treat as new record and insert. Do not insert a new record if a Pending record already exists for this company + role.
+
+Payload fields: `company`, `role`, `status` (`Reviewed`), `score_pct`, `comp`, `link`, `source`, `notes`, `applied_date` (if Applied), `applied_method` (if Applied). Do not include `date`, `score`, `score_label`, `verdict`, or `tier` — these fields do not exist in v2.
+
+Status values: `Pending` | `Reviewed` | `Queued` | `Applied` | `Screening` | `Interview` | `Offer` | `Pass` | `Closed`
 
 For the review and any tailoring, determine which resume is the stronger starting point
 for the specific role and say which one you're using and why. If the role is ambiguous,
@@ -150,8 +171,8 @@ Leadership:
 
 Use this exact section order:
 
-**1. TL;DR** — 2-3 sentences max. Lead with the match score and category, then the
-single most important reason you are or aren't a fit. Be blunt and specific.
+**1. TL;DR | Score% — Category** — 2-3 sentences max. The single most important
+reason you are or aren't a fit. Be blunt and specific.
 
 **2. Score Breakdown** — Show the component table with scores and math:
 
@@ -165,15 +186,27 @@ single most important reason you are or aren't a fit. Be blunt and specific.
 
 Gate status: PASS or FAIL (with cap applied if failed)
 
+**Output format is mandatory — never violate:**
+- Always use the four-component weighted matrix above
+- Never substitute a factor/direction table, bullet list, or any other format
+- Never omit the component score table from any review output
+- If context has been compacted or files re-read mid-session, re-read this scoring section before delivering the next verdict
+
 Score categories:
 - **Strong Match (75–100%)** — Meets hard requirements, strong on soft requirements, trajectory aligns. Worth applying as-is.
 - **Competitive Match (50–74%)** — Meets most hard requirements, some addressable gaps. Worth applying with a tailored resume.
 - **Stretch Match (25–49%)** — Missing key requirements but has transferable strengths. Long shot but not unreasonable.
 - **Poor Match (0–24%)** — Fundamental misalignment. Be direct about this.
 
-**3. Job Parsing** — Break down what the role actually requires:
-- Hard requirements, soft requirements, hidden signals, seniority calibration,
-  compensation signals (as described in Step 1 above)
+**3. Job Parsing** — Use this exact format:
+
+| Met ✅ | Unmet / Risk ⚠️❌ |
+|---|---|
+| [hard req met] | [hard req missing or at risk] |
+
+**Soft reqs:** [comma-separated list]
+**Hidden signals:** [one sentence — what the JD implies but doesn't say outright]
+**Seniority / Comp:** [level calibration] | [comp range or "not posted"] | [Remote/Hybrid/Onsite] | [close date if listed]
 
 ### Step 4: Resume Revision (If Requested)
 
@@ -215,5 +248,5 @@ At review completion, write to event_log:
 
 At DB write completion, write to event_log:
 - event_type: "db_write"
-- event_detail: "job-tracker.db — reviewed_postings"
+- event_detail: "Routed insert through integrity.py — result: [APPROVED/DUPLICATE/REJECTED]"
 - result: "pass" or "fail"
