@@ -102,6 +102,24 @@ Domain gaps are handled by the scoring rubric (20% weight on Domain Knowledge co
 
 ---
 
+## Dashboard
+
+The live dashboard is the FastAPI + Vite app in `C:/Users/Garrison/career/dashboard-app/`.
+
+| Component | Directory | Command | Port |
+|-----------|-----------|---------|------|
+| Backend | `dashboard-app/backend` | `.venv/Scripts/python -m uvicorn app.main:app --port 8001` | 8001 |
+| Frontend | `dashboard-app/frontend` | `npm run dev` | 5173 |
+
+Open `http://localhost:5173` in the browser.
+
+**Do NOT use:**
+- `dashboard_fresh.py` — deprecated legacy static generator (entry point commented out)
+- `dashboard.html` — stale static output file, not the real dashboard
+- `start "" dashboard.html` — opens a static file, not the live app
+
+---
+
 ## Target Role Tracks
 
 Evaluate against BOTH tracks before filtering.
