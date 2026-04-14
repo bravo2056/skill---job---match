@@ -25,9 +25,28 @@ Append new rows to the existing array in place. Do not create helper scripts, te
 or delayed write buffers. Do not stage rows anywhere else first. This direct per-email
 write is mandatory so extracted rows survive context compaction.
 
-**Step 4:** Body handling rules — apply to every digest read:
-- If body exceeds ~50KB, extract only: job titles, company names, compensation, location, and links. Ignore all HTML scaffolding, footer text, legal copy, and newsletter formatting.
-- Cap extraction at 25 roles per email. Prioritize by title keyword match: Program Manager, TPM, Technical Program Manager, Operations, Process, Automation, Workflow, Systems. Discard the remainder silently.
+**Step 4:** Backpressure rule — strict execution contract
+
+If a Jobright message body exceeds 50KB, is malformed, or triggers a token limit error, execute the following steps in exact order with no deviation:
+
+1. Extract a maximum of 25 roles from the readable portion only.
+2. Write those rows to `scan-staging.json` immediately. This write must occur before any further tool calls or message processing.
+3. Log the `message_id` and `skipped_rows` count to the Phase 1 summary.
+4. Mark the message as `partial_processed = true`.
+5. Stop all processing of this message permanently for the current run.
+6. Move to the next message.
+
+Prohibitions — explicitly enforced:
+
+- Do not attempt to read additional portions of the same message after this rule triggers.
+- Do not retry the same message with different tools.
+- Do not attempt to reconstruct skipped rows later in the session.
+- Do not summarize, estimate, or infer skipped content.
+- Do not exceed 25 extracted roles under any condition.
+
+Completion definition: A message marked `partial_processed = true` is considered complete for this run. It must not be revisited by any downstream step, including Phase 2 scoring, duplicate checking, or any recovery logic.
+
+**Step 4a:** Link cleaning — apply to every extracted row:
 - Extract canonical job links by removing all tracking parameters (e.g., utm_*, ref, tracking IDs) before writing the row.
 - Store only the cleaned canonical URL in `canonical_link`.
 - Do not store raw tracking URLs under any condition.
@@ -58,16 +77,16 @@ Do not begin Phase 2 until the user explicitly confirms.
 
 Only after explicit user confirmation:
 
-**Step 1:** Write all non-duplicate, non-flagged extracted rows to DB by calling `python integrity.py --action insert --payload '<json>'`. Payload fields: `company`, `role`, `status` (`Pending`), `comp`, `link`, `source`, `notes`. Do not include `score`, `score_pct`, `score_label`, `verdict`, or `tier`.
+**Step 1:** Write all non-flagged extracted rows to DB by calling `python integrity.py --action ingest --payload '<json>'`. Payload fields: `company`, `role`, `comp`, `location`, `remote_status`, `link`, `source`, `inferred_employer`, `notes`. Do not include `status`, `score`, `score_pct`, `score_label`, `verdict`, or `tier` — integrity.py determines status. Result codes: APPROVED (staged as Pending), AUTO-PASS (filtered by business rule, written as Pass), DUPLICATE (skipped), REJECTED (schema error).
 
-**Step 2:** Log each write result — APPROVED, DUPLICATE, or REJECTED — to event_log.
+**Step 2:** Log each write result — APPROVED, AUTO-PASS, DUPLICATE, or REJECTED — to event_log.
 
 **Step 3:** Produce the manual cleanup list of all scanned digest emails.
 
 **Step 4:** Run `python C:/Users/Garrison/career/dashboard.py --file C:/Users/Garrison/career/dashboard.html` via bash. Log completion.
 
 **Step 5:** Output scan completion summary:
-> "Scan complete — [N] emails processed, [N] digests read, [N] roles extracted, [N] written as Pending, [N] duplicates skipped, [N] rejected."
+> "Scan complete — [N] emails processed, [N] digests read, [N] roles extracted, [N] staged as Pending, [N] auto-passed (filtered), [N] duplicates skipped, [N] rejected."
 
 **Hard rules — never violate:**
 - Never create helper scripts, append utilities, temp writers, or any other improvised code to write staging rows
