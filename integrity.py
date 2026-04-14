@@ -14,6 +14,12 @@ VALID_STATUSES  = {'Pending','Reviewed','Queued','Applied','Screening','Intervie
 APPLIED_STATES  = {'Applied','Screening','Interview','Offer','Closed'}
 TERMINAL_STATES = {'Pass','Closed'}
 
+ACRONYM_MAP = {
+    'sr': 'senior',
+    'jr': 'junior',
+    'tpm': 'technical program manager',
+}
+
 
 def company_key(raw):
     if not raw: return ''
@@ -21,11 +27,16 @@ def company_key(raw):
 
 def role_key(raw):
     if not raw: return ''
-    key = raw.lower().strip()
-    key = re.sub(r'\bsenior\b', 'sr', key)
-    key = re.sub(r'\bsr\.', 'sr', key)
-    key = re.sub(r'\bjunior\b', 'jr', key)
-    return re.sub(r'\s+', ' ', key)
+    key = re.sub(r'[^\w\s]', '', raw.lower().strip())
+    tokens = key.split()
+    expanded = []
+    for t in tokens:
+        if t in ACRONYM_MAP:
+            expanded.extend(ACRONYM_MAP[t].split())
+        else:
+            expanded.append(t)
+    tokens = sorted(set(expanded))
+    return ' '.join(tokens)
 
 def now_utc():
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
@@ -136,6 +147,10 @@ def handle_update_status(payload, conn):
         sets.append("applied_date=?"); vals.append(payload['applied_date'])
     if payload.get('applied_method'):
         sets.append("applied_method=?"); vals.append(payload['applied_method'])
+    if payload.get('notes') is not None:
+        sets.append("notes=?"); vals.append(payload['notes'])
+    if payload.get('remote_status') is not None:
+        sets.append("remote=?"); vals.append(payload['remote_status'])
     if status in APPLIED_STATES and current_status not in APPLIED_STATES:
         sets.append("applied_at=?"); vals.append(ts)
     if status in TERMINAL_STATES:
@@ -181,6 +196,10 @@ def handle_update_score(payload, conn):
         sets.append("comp=?"); vals.append(payload['comp'])
     if payload.get('link'):
         sets.append("link=?"); vals.append(payload['link'])
+    if payload.get('notes') is not None:
+        sets.append("notes=?"); vals.append(payload['notes'])
+    if payload.get('remote_status') is not None:
+        sets.append("remote=?"); vals.append(payload['remote_status'])
 
     vals.append(payload['id'])
     cur.execute(f"UPDATE reviewed_postings SET {', '.join(sets)} WHERE id=?", vals)
@@ -265,16 +284,176 @@ def handle_age_pass(conn):
     }
 
 
+VERIZON_STOP = re.compile(r'\bverizon\b', re.IGNORECASE)
+NON_TARGET_ROLES = {'recruiter', 'recruiting coordinator', 'talent acquisition'}
+PMP_HARD_REQ = re.compile(r'\bpmp\s+(required|must)\b', re.IGNORECASE)
+UNDERLEVELED = {'intern', 'associate', 'entry level', 'entry-level'}
+
+
+def _comp_ceiling_fail(payload):
+    comp = payload.get('comp')
+    if comp is not None and comp < 80000:
+        return 'Comp below floor'
+    return None
+
+
+def _commute_fail(payload):
+    remote = payload.get('remote')
+    if remote is not None and remote == 0:
+        location = payload.get('location', '').lower()
+        if 'nj' not in location and 'new jersey' not in location and 'remote' not in location:
+            return 'Non-remote, outside NJ'
+    return None
+
+
+def apply_filters(payload):
+    for check in (_comp_ceiling_fail, _commute_fail):
+        reason = check(payload)
+        if reason:
+            return reason
+    return None
+
+
+def handle_ingest(payload, conn):
+    for field in ('company', 'role'):
+        if not payload.get(field):
+            return reject(f"Missing required field: {field}")
+
+    company = payload['company']
+    role = payload['role']
+    jd_text = payload.get('jd_text', '')
+
+    # --- filter gate ---
+    fail_reason = None
+
+    if VERIZON_STOP.search(company):
+        fail_reason = 'Verizon hard stop'
+    elif role.lower().strip() in NON_TARGET_ROLES:
+        fail_reason = 'Non-target role'
+    elif any(tag in role.lower() for tag in UNDERLEVELED):
+        fail_reason = 'Underleveled'
+    elif PMP_HARD_REQ.search(jd_text):
+        fail_reason = 'PMP hard requirement'
+    else:
+        fail_reason = apply_filters(payload)
+
+    status = 'Pass' if fail_reason else 'Pending'
+    notes = f'Auto-filtered: {fail_reason}' if fail_reason else payload.get('notes')
+
+    insert_payload = {**payload, 'status': status, 'notes': notes}
+    return handle_insert(insert_payload, conn)
+
+
+def handle_delete(payload, conn):
+    cur = conn.cursor()
+
+    if not payload.get('id'):
+        return reject("id is required for delete")
+    if not payload.get('confirm'):
+        return reject("confirm:true is required for delete")
+
+    cur.execute("SELECT id, company, role, status FROM reviewed_postings WHERE id=?", (payload['id'],))
+    row = cur.fetchone()
+    if not row:
+        return reject(f"No record with id={payload['id']}")
+
+    status = row[3]
+    if status in APPLIED_STATES and not payload.get('force'):
+        return reject(f"Record is {status} — force:true required to delete Applied+ records")
+
+    cur.execute("DELETE FROM reviewed_postings WHERE id=?", (payload['id'],))
+    conn.commit()
+    return {"result": "OK", "data": {"id": row[0], "company": row[1], "role": row[2]},
+            "message": f"Deleted id={row[0]}"}
+
+
+def handle_resolve_id(payload, conn):
+    cur = conn.cursor()
+
+    company = payload.get('company', '')
+    role = payload.get('role', '')
+    if not company or not role:
+        return reject("company and role are required for resolve_id")
+
+    ck = company_key(company)
+    rk = role_key(role)
+
+    cur.execute(
+        "SELECT id, company, role, status FROM reviewed_postings WHERE company_key=? AND role_key=?",
+        (ck, rk)
+    )
+    rows = cur.fetchall()
+
+    if len(rows) == 1:
+        r = rows[0]
+        return {"result": "OK", "data": {"id": r[0], "company": r[1], "role": r[2], "status": r[3]},
+                "message": f"Resolved to id={r[0]}"}
+    elif len(rows) > 1:
+        matches = [{"id": r[0], "company": r[1], "role": r[2], "status": r[3]} for r in rows]
+        return {"result": "AMBIGUOUS", "data": {"matches": matches},
+                "message": f"{len(rows)} exact matches found"}
+    else:
+        return {"result": "NOT_FOUND", "data": {},
+                "message": f"No match for company_key='{ck}', role_key='{rk}'"}
+
+
+MONITOR_DB_PATH = r"C:/Users/Garrison/career/monitor.db"
+
+
+def handle_resolve_flag(payload):
+    if not payload.get('id'):
+        return reject("id is required for resolve_flag")
+
+    conn = sqlite3.connect(MONITOR_DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, flag_type, severity, resolved_at FROM quality_flags WHERE id=?", (payload['id'],))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return reject(f"No quality_flag with id={payload['id']}")
+    if row[3] is not None:
+        conn.close()
+        return {"result": "OK", "data": {"id": row[0]}, "message": f"Already resolved at {row[3]}"}
+
+    ts = now_utc()
+    cur.execute("UPDATE quality_flags SET resolved_at=? WHERE id=?", (ts, payload['id']))
+    conn.commit()
+    conn.close()
+    return {"result": "OK", "data": {"id": row[0], "flag_type": row[1], "severity": row[2]},
+            "message": f"Flag id={row[0]} resolved at {ts}"}
+
+
+def ensure_constraints(conn):
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_company_role "
+        "ON reviewed_postings (company_key, role_key)"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--action',  required=True, choices=['insert','update_status','update_score','audit','age_pass'])
+    parser.add_argument('--action',  required=True, choices=['insert','ingest','update_status','update_score','audit','age_pass','resolve_id','delete','resolve_flag'])
     parser.add_argument('--payload', default='{}')
     args = parser.parse_args()
 
     payload = json.loads(args.payload)
-    conn    = sqlite3.connect(DB_PATH)
+
+    # resolve_flag operates on monitor.db, not job-tracker.db
+    if args.action == 'resolve_flag':
+        try:
+            result = handle_resolve_flag(payload)
+        except Exception as e:
+            result = {"result": "ERROR", "data": {}, "message": str(e)}
+        print(json.dumps(result, indent=2))
+        return
+
+    conn = sqlite3.connect(DB_PATH)
 
     try:
+        if args.action not in ('audit', 'delete'):
+            ensure_constraints(conn)
+
         # Always run age_pass silently on every invocation
         if args.action != 'age_pass':
             handle_age_pass(conn)
@@ -287,6 +466,14 @@ def main():
             result = handle_update_score(payload, conn)
         elif args.action == 'age_pass':
             result = handle_age_pass(conn)
+        elif args.action == 'ingest':
+            result = handle_ingest(payload, conn)
+        elif args.action == 'resolve_id':
+            result = handle_resolve_id(payload, conn)
+        elif args.action == 'delete':
+            result = handle_delete(payload, conn)
+        elif args.action == 'audit':
+            result = handle_audit(conn)
     except Exception as e:
         result = {"result": "ERROR", "data": {}, "message": str(e)}
     finally:
