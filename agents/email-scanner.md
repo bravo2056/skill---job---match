@@ -25,26 +25,42 @@ Append new rows to the existing array in place. Do not create helper scripts, te
 or delayed write buffers. Do not stage rows anywhere else first. This direct per-email
 write is mandatory so extracted rows survive context compaction.
 
-**Step 4:** Backpressure rule — strict execution contract
+**Step 4:** Backpressure rule — strict execution contract (all messages)
 
-If a Jobright message body exceeds 50KB, is malformed, or triggers a token limit error, execute the following steps in exact order with no deviation:
+If a message is large enough to trigger context pressure, truncated reads, or tool warnings (commonly ~50KB+), or cannot be fully processed in a single pass, execute the following steps in exact order with no deviation:
 
-1. Extract a maximum of 25 roles from the readable portion only.
+1. Extract up to 25 roles from the readable portion only.
 2. Write those rows to `scan-staging.json` immediately. This write must occur before any further tool calls or message processing.
-3. Log the `message_id` and `skipped_rows` count to the Phase 1 summary.
-4. Mark the message as `partial_processed = true`.
-5. Stop all processing of this message permanently for the current run.
-6. Move to the next message.
+3. Append an entry to `partial_messages` in the Phase 1 summary:
+   ```json
+   {
+     "message_id": "<id>",
+     "extracted_count": "<n>",
+     "skipped_rows": "<m>"
+   }
+   ```
+4. Stop processing this message.
+5. Continue to the next message.
 
-Prohibitions — explicitly enforced:
+Hard constraints:
 
-- Do not attempt to read additional portions of the same message after this rule triggers.
-- Do not retry the same message with different tools.
-- Do not attempt to reconstruct skipped rows later in the session.
-- Do not summarize, estimate, or infer skipped content.
-- Do not exceed 25 extracted roles under any condition.
+- Never read this message again in the same run.
+- Never attempt a second extraction pass.
+- Never exceed 25 roles under any condition.
+- Never infer or reconstruct skipped rows.
+- Never perform additional analysis on skipped content.
 
-Completion definition: A message marked `partial_processed = true` is considered complete for this run. It must not be revisited by any downstream step, including Phase 2 scoring, duplicate checking, or any recovery logic.
+Malformed definition — explicit triggers only:
+A message is considered malformed if required fields (title or link) cannot be consistently identified across entries, or if the structure is truncated or broken such that sequential extraction cannot proceed. HTML quality and encoding issues alone do not qualify.
+
+Token limit handling:
+If a token limit error occurs, treat it as a fallback trigger. Execute the backpressure sequence using whatever portion of the message remains accessible.
+
+Completion rule:
+The message is considered complete after partial processing and must not be revisited in the current run. Rows already written to `scan-staging.json` proceed through Phase 2 (ingest, dedup, scoring) normally.
+
+Note on duplication:
+This rule intentionally reinforces existing limits (25-role cap, immediate write) and overrides normal flow when triggered.
 
 **Step 4a:** Link cleaning — apply to every extracted row:
 - Extract canonical job links by removing all tracking parameters (e.g., utm_*, ref, tracking IDs) before writing the row.
