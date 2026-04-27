@@ -2,7 +2,7 @@ import sqlite3
 import json
 from datetime import datetime
 
-conn = sqlite3.connect(r"C:/Users/<username>/career/monitor.db")
+conn = sqlite3.connect(r"C:/Users/Garrison/career/monitor.db")
 conn.row_factory = sqlite3.Row
 cur = conn.cursor()
 
@@ -82,7 +82,7 @@ data = {
     "recent_flags": recent_flags
 }
 
-with open(r"C:/Users/<username>/career/monitor-data.js", "w") as f:
+with open(r"C:/Users/Garrison/career/monitor-data.js", "w") as f:
     f.write(f"const MONITOR_DATA = {json.dumps(data, indent=2)};")
 
 print("monitor-data.js written.")

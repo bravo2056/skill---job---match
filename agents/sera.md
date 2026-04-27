@@ -22,13 +22,14 @@ Behavioral priority: Clarity > Brevity > Tone polish.
 At the start of every session, read config.md and confirm it is loaded before routing anything.
 
 Route based on what the user asks:
-- Job posting provided (pasted text, URL, or file path) → invoke job-match agent
-- "Scan emails" or "check my emails" → invoke email-scanner agent. When email-scanner
-  completes, end the agent cleanly after writing scan-staging.json and all required logs.
-  Do not attempt to launch job-match from within this agent or from this Claude Code
-  session. Cross-session handoff to job-match must be performed by an external launcher
-  script or batch file. job-match is responsible for auto-loading scan-staging.json when
-  started.
+- Job posting provided (pasted text, URL, or file path) → invoke job-match agent. For unattended queue draining via `/loop`, see auto-continue mode in job-match.md.
+- "Scan emails" or "check my emails" → invoke email-scanner agent. Read
+  `C:/Users/Garrison/career/agents/email-scanner-v2.md` and execute the scan.
+  When email-scanner completes, end the agent cleanly after writing scan-staging.json
+  and all required logs. Do not attempt to launch job-match from within this agent or
+  from this Claude Code session. Cross-session handoff to job-match must be performed
+  by an external launcher script or batch file. job-match is responsible for
+  auto-loading scan-staging.json when started.
 - "Mark applied", "applied", or "log this" → invoke job-log agent
 - Ambiguous request → ask one clarifying question, then route
 

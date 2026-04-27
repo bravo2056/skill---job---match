@@ -33,6 +33,89 @@ Under no condition should this agent idle waiting for input if the staging file 
 Read both resumes, the LinkedIn profile, and the scan staging file (if present) at the
 start of every review session. If any required file is missing, tell the user.
 
+## Queue Processing Contract
+
+When scan-staging.json is loaded, you are processing a queue — not producing a
+combined report. Enforce these rules mechanically. They do not relax under context
+pressure, queue size, or any other condition.
+
+**Output cadence — 12 roles per response, no approval asked.**
+Process 12 Pending reviews per response. For each row: fetch the canonical_link (see "JD text — fetch from canonical_link" below for the fetch tool), compute the full structured verdict, write it to the DB via `integrity.py --action write_review`, and emit one summary line in chat. Summary line format: `#<id> <Company> — <Role>  <score>%  <gate>  <resume>` (use `null  —  JD-fail` when the JD fetch failed). After the 12th review, append a totals line (`Wrote: <N> verdicts | <M> JD-fail | <K> errors`) and a `Next: [Company] — [Role]` pointer, then stop. If the queue empties before 12, emit the queue completion notice (see below) instead of `Next:`. The next user message triggers the next batch.
+
+**Auto-continue mode — operator-driven via /loop. Status: untested in production.**
+End-to-end /loop firing has not been verified against this agent. Do not test on a live queue without supervision. The remaining text in this section is the design; treat any production use as a manual run until the loop path is verified.
+
+The pause-every-12 cadence is drift safety WITHIN a batch, not between batches. To drain a queue unattended, the operator kicks off job-match then invokes `/loop 1m continue` (1m is the scheduler's minimum interval; /loop only fires while the REPL is idle, so in practice each fire lands the moment the previous batch finishes). The agent enforces a 6-batch cap per run so unattended drains are bounded (~72 roles at the standard cadence).
+
+The counter is event_log-backed, not session memory:
+- Before each batch, query event_log for `auto_continue_batch` entries since the most recent `auto_continue_start`. That count is the current run's batch index.
+- If no open run exists, write `auto_continue_start` with `run_id=<UTC timestamp>` before processing the batch.
+- After each batch completes, write `auto_continue_batch` with `run_id`, `batch_index`, `processed_count`, `queue_remaining`.
+
+The counter increments per BATCH processed, not per inbound message — /loop's message format is irrelevant. Persistent across context compaction. If context is compacted mid-run, re-read this section and re-query event_log before processing the next batch.
+
+Stop conditions — each writes `auto_continue_stop` to event_log with a matching `reason`:
+- **Queue empty** (`reason=queue_empty`): emit the existing queue-complete line.
+- **Cap reached** (`reason=max_batches`): emit exactly `[AUTO-CONTINUE CAP REACHED — type a non-continue message to proceed]` and refuse further batches.
+- **Explicit error** (`reason=error`): emit the existing failure line.
+
+While a run is paused at cap (most recent auto-continue event is `auto_continue_stop reason=max_batches`), every incoming message is gated:
+- If the message is *bare* — one of `continue`, `next`, `go`, `ok`, `yes`, `y`, or empty/whitespace — re-emit the cap line and refuse processing. Do not write a new `auto_continue_start`.
+- If the message is *substantive* — anything else, including any slash command, question, file path, or multi-word instruction — treat it as authorization for a new run. The next batch starts a new run with a new `run_id`.
+
+The cap stop string is informational. /loop may not support stop-on-string match; until verified, the operator stops /loop manually when the cap line appears in chat. The agent enforces the cap regardless — additional /loop fires after the cap only echo the cap line.
+
+**Verdict payload — never abbreviated.**
+The full verdict (TL;DR, 4 component scores with recency multiplier, gate status with failures if any, met/unmet lists, soft reqs, hidden signals, seniority calibration, comp note, resume_used) is written to the DB via `write_review`. Every field in the payload is required — no skipping fields for "obvious" roles, short JDs, or queue length. integrity.py validates and rejects malformed payloads. Chat output is a single summary line per review (see cadence rule above); the full structured verdict lives in the DB and renders in the dashboard expand-row card.
+
+**JD text — fetch from canonical_link.**
+scan-staging.json rows contain metadata only. For each role, fetch the canonical_link and use the returned content as the scoring basis.
+
+Fetch tool selection:
+- **LinkedIn URLs (`linkedin.com`, `lnkd.in`) and any other auth-walled host:** use the connected Chrome MCP browser. Issue a single `mcp__Claude_in_Chrome__browser_batch` that navigates to the URL and reads the page text in one call. Never use sequential MCP browser actions — use `browser_batch` from the start. Do not use WebFetch for these URLs; it hits an unauthenticated session and returns the login wall.
+- **All other public URLs** (jobright.ai, ziprecruiter.com, hiring.cafe redirects, indeed.com redirects, company career pages with no auth wall): use WebFetch.
+- **If WebFetch returns the auth-wall fallback signature for a host you didn't expect to be auth-walled:** retry once via Chrome MCP `browser_batch` before giving up.
+
+**Closed / expired posting detection.**
+After the fetch, before scoring, scan the page text for closed-posting indicators:
+- "No longer accepting applications"
+- "This job is no longer available"
+- "Position has been filled"
+- "Applications are closed"
+- HTTP 404 or equivalent "not found" body
+- LinkedIn's "We couldn't find this job" page
+
+If any indicator is present, do NOT call `write_review`. Instead call:
+
+`python integrity.py --action update_status --payload '{"id":<id>,"status":"Pass","notes":"Posting closed before review — <canonical_link>"}'`
+
+The chat summary line for these rows uses the format: `#<id> <Company> — <Role>  —  closed  —  Pass`.
+
+Skip to the next row. Do not generate a metadata-only verdict for closed postings — the row exits the queue cleanly via Pass with a closure note.
+
+**On fetch failure or empty content (NOT a closed-posting indicator — actual fetch error):** do not skip the row. Score conservatively from the staging metadata available (role title, company, comp range, location, source, staffing flag, inferred employer) and write the verdict via `write_review` so the row transitions Pending → Reviewed and exits the retry loop. When scoring metadata-only:
+
+- Begin the `tldr` with `[JD FETCH FAILED — metadata-only review]` so it is visible in the dashboard card.
+- Make the first entry in `unmet` exactly: `Full JD content unavailable — verdict scored from staging metadata only; manual JD review recommended before applying.`
+- Begin `hidden_signals` with `[Metadata-only review]` to flag the limitation everywhere it surfaces.
+- Lower component scores 10–15 points relative to what the title and metadata suggest, to reflect verdict-confidence loss. Never fabricate met/unmet items beyond what the title and staging fields actually support.
+- Gate evaluation: if the title alone clearly violates a hard constraint (e.g., explicit Verizon hard-stop, comp floor, location), set `gate_status=FAIL` with that reason. Otherwise set `gate_status=PASS` so the metadata-only verdict isn't auto-capped — the metadata-only flag in tldr/unmet/hidden_signals carries the warning instead.
+
+The chat summary line for these rows uses the format: `#<id> <Company> — <Role>  <score>%  <gate>  <resume>  (metadata-only)`.
+
+If the user later supplies a real JD link, they can reset the row's status to Pending and the next run will re-score it with full content. Never fabricate JD content under any condition.
+
+**Resume safety — check status before scoring.**
+Before scoring each row, call `integrity.py --action resolve_id` with company and
+role. If existing status is anything other than `Pending`, skip silently and
+advance to the next row. This makes the queue idempotent across session crashes.
+
+**Queue completion.**
+When the last Pending row is processed, output exactly:
+> "Queue complete — [N] reviewed, [M] skipped (already processed), [K] JD-fetch failures."
+
+Then overwrite `scan-staging.json` with `[]` to prevent re-scoring on the next run.
+
 ## Database (Phase 2 — parallel writes active)
 
 Primary database: `C:/Users/Garrison/career/job-tracker.db` (SQLite)
@@ -55,18 +138,29 @@ Do not create helper scripts, temp scripts, or one-off Python files to perform D
 If `integrity.py` does not support the required action, stop and surface the limitation.
 Do not work around it under any condition.
 
-After every review, write score_pct via:
-`python integrity.py --action update_score --payload '{"id": <id>, "score_pct": <score>}'`
-Do not write `score_label`, `tier`, or `verdict` — these are derived and never stored.
+After every successful review, write the full structured verdict via:
+`python integrity.py --action write_review --payload '<json>'`
+Required payload fields: `id`, `tldr`, `gate_status` (PASS|FAIL), `gate_failures` (list of strings, required when gate=FAIL), `hard_skills_score`, `experience_score`, `domain_score`, `leadership_score` (ints 0-100), `recency_multiplier` (1.00|0.75|0.50|0.25), `met` (list), `unmet` (list), `soft_reqs`, `hidden_signals`, `seniority_calibration`, `resume_used` (pm|automation|both). Optional: `comp`, `link`, `notes`.
 
-**Before writing**, call `python integrity.py --action insert --payload '<json>'`.
-Do not run a manual SQL dedup check. If result is DUPLICATE:
-- If existing record status is `Pending`, transition via `integrity.py --action update_status` — do not prompt the user.
-- If existing record status is anything other than `Pending`, skip silently and log the duplicate to event_log. Do not surface to user, do not write.
+Status transitions handled by integrity.py — never set `status` in the payload:
+- **Gate PASS, currently Pending** → row transitions to `Reviewed`.
+- **Gate FAIL** (and current status is not already terminal) → row auto-transitions to `Pass`. `closed_at` is set. The gate-failure reasons are folded into `notes` automatically so the closure rationale is preserved. The full verdict (TL;DR, scores, met/unmet, etc.) is still stored on the row and renders in the dashboard expand-card.
+- **Currently terminal (Pass, Closed)** → write_review is rejected.
 
-**After every review**, submit payload to integrity.py. Default status on review write is `Reviewed`. If the record already exists in DB with status `Pending` (ingested by email-scanner), call `integrity.py --action update_status` to transition `Pending → Reviewed` rather than inserting a duplicate. Matching must use normalized company and role (case-insensitive, trimmed). If no exact match is found, treat as new record and insert. Do not insert a new record if a Pending record already exists for this company + role.
+integrity.py computes `score_pct` from the components (FAIL caps at 35). Do not pass `score_pct`, `score_label`, `tier`, `verdict`, or `status` — these are derived/managed by integrity.py.
 
-Payload fields: `company`, `role`, `status` (`Reviewed`), `score_pct`, `comp`, `link`, `source`, `notes`, `applied_date` (if Applied), `applied_method` (if Applied). Do not include `date`, `score`, `score_label`, `verdict`, or `tier` — these fields do not exist in v2.
+**Before writing**, call `python integrity.py --action ingest --payload '<json>'`.
+This routes new rows through the same filter gates the email-scanner uses (Verizon hard stop, comp ceiling, underleveled, PMP-required, non-target roles, NJ commute). Do not call `insert` directly — it bypasses those gates and is reserved for callers that have already filtered.
+
+Do not run a manual SQL dedup check. Possible results from `ingest`:
+- `APPROVED` — new row staged as Pending. Proceed to `write_review`.
+- `AUTO-PASS` — row was filtered by the gate and written as Pass. Skip to next row; do not write a verdict for it.
+- `DUPLICATE` — row already exists.
+  - If existing record status is `Pending`, transition via `integrity.py --action update_status` — do not prompt the user — then proceed to `write_review`.
+  - If existing record status is anything other than `Pending`, skip silently and log the duplicate to event_log. Do not surface to user, do not write.
+- `REJECTED` — schema error. Log to event_log and skip.
+
+Matching during ingest uses normalized company and role (case-insensitive, trimmed) and is handled by integrity.py — do not run a separate match check.
 
 Status values: `Pending` | `Reviewed` | `Queued` | `Applied` | `Screening` | `Interview` | `Offer` | `Pass` | `Closed`
 
@@ -232,21 +326,26 @@ Save the revised resume to `C:/Users/Garrison/career/tailored/[company]-[role].m
 
 ## Session Logging
 
-At task start, write to event_log:
+All event_log writes route through:
+`python integrity.py --action event_log_write --payload '{"agent_name":"job-match","session_id":"<run_session_id>","event_type":"<type>","event_detail":"<detail>","result":"pass|fail"}'`
+
+Direct sqlite3 writes to monitor.db are not used for event_log entries.
+
+At task start, write to event_log via integrity.py:
 - event_type: "file_read"
 - event_detail: which resume and config files were loaded
 - result: "pass" or "fail"
 
-If a required file cannot be read, write to quality_flags:
+If a required file cannot be read, write to quality_flags via integrity.py write_flag:
 - flag_type: "file_skip"
 - severity: "high"
 
-At review completion, write to event_log:
+At review completion, write to event_log via integrity.py:
 - event_type: "review_complete"
 - event_detail: company, role, score
 - result: "pass"
 
-At DB write completion, write to event_log:
+At DB write completion, write to event_log via integrity.py:
 - event_type: "db_write"
-- event_detail: "Routed insert through integrity.py — result: [APPROVED/DUPLICATE/REJECTED]"
+- event_detail: "Routed ingest through integrity.py — result: [APPROVED/AUTO-PASS/DUPLICATE/REJECTED]"
 - result: "pass" or "fail"

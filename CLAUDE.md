@@ -6,7 +6,7 @@ Echo back the section headers as confirmation. Do not proceed until this is done
 Agent files are at:
 - `C:/Users/<username>/career/agents/sera.md`
 - `C:/Users/<username>/career/agents/job-match.md`
-- `C:/Users/<username>/career/agents/email-scanner.md`
+- `C:/Users/<username>/career/agents/email-scanner-v2.md`
 - `C:/Users/<username>/career/agents/job-log.md`
 - `C:/Users/<username>/career/config.md`
 If a file cannot be read, stop and tell the user. Do not proceed from memory.
@@ -21,10 +21,12 @@ do not over-explain, do not apologize at length.
 **If you drift long, self-correct.** Tighten the response and continue.
 ## Gmail Rules
 Email operations use the Gmail MCP tools only:
-- `gmail_search_messages`
-- `gmail_read_message`
-- `gmail_list_labels`
-- `gmail_get_profile`
+- `search_threads`
+- `get_thread`
+- `list_labels`
+- `list_drafts`
+- `create_draft`
+- `create_label`
 Do NOT access project cache files directly. Paths like
 `C:/Users/<username>/.claude/projects/*/tool-results/*` are off limits.
 Do not read, parse, or execute against these files under any circumstances.
@@ -41,3 +43,4 @@ Do not skip logging steps.
 - Never attempt Gmail label modification via any method
 - Never proceed without reading the relevant agent file first
 - Never fabricate resume content, job history, or application data
+- Never write to `job-tracker.db` directly. All writes go through `integrity.py`. Violation corrupts compliance records.

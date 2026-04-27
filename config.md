@@ -12,39 +12,25 @@ Single source of truth for all subagents. Read this file at startup before doing
 | Resume (Automation) | `C:/Users/Garrison/career/resume-automation.md` |
 | LinkedIn profile | `C:/Users/Garrison/career/linkedin.md` |
 | Job search log (CSV) | `C:/Users/Garrison/career/job-search-log.csv` |
-| Reviewed postings log | `C:/Users/Garrison/career/reviewed-postings.md` |
 
 ---
 
 ## SQLite Database
 
 Primary database: `C:/Users/Garrison/career/job-tracker.db`
-Backup flat file: `C:/Users/Garrison/career/reviewed-postings.md` (read-only backup, keep in sync)
 
-**Read pattern** — check for duplicate before delivering a review:
-```python
-import sqlite3
-conn = sqlite3.connect(r"C:/Users/Garrison/career/job-tracker.db")
-cur = conn.cursor()
-cur.execute("SELECT date, score, verdict, status FROM reviewed_postings WHERE company=? AND role=?", (company, role))
-row = cur.fetchone()
-conn.close()
-```
+All reads and writes route through `integrity.py`. Do not open `job-tracker.db`
+directly. Do not write raw SQL. Do not import `sqlite3` for write operations.
 
-**Write pattern** — run after every review:
-```python
-import sqlite3
-conn = sqlite3.connect(r"C:/Users/Garrison/career/job-tracker.db")
-cur = conn.cursor()
-cur.execute("""
-    INSERT INTO reviewed_postings (date, company, role, score, score_pct, verdict, status, comp, remote, link, notes)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-""", (date, company, role, score_label, score_int, verdict, status, comp, remote, link, notes))
-conn.commit()
-conn.close()
-```
+Common actions:
+- `python integrity.py --action ingest --payload '<json>'`
+- `python integrity.py --action insert --payload '<json>'`
+- `python integrity.py --action update_status --payload '{"id":N,"status":"Reviewed"}'`
+- `python integrity.py --action update_score --payload '{"id":N,"score_pct":N}'`
+- `python integrity.py --action resolve_id --payload '{"company":"X","role":"Y"}'`
+- `python integrity.py --action audit`
 
-Status values: `Pending` | `Applied` | `Borderline` | `Pass` | `Reviewing`
+Status values: `Pending` | `Reviewed` | `Queued` | `Applied` | `Screening` | `Interview` | `Offer` | `Pass` | `Closed`
 
 ---
 
