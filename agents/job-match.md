@@ -40,7 +40,7 @@ combined report. Enforce these rules mechanically. They do not relax under conte
 pressure, queue size, or any other condition.
 
 **Output cadence — 12 roles per response, no approval asked.**
-Process 12 Pending reviews per response. For each row: fetch the canonical_link (see "JD text — fetch from canonical_link" below for the fetch tool), compute the full structured verdict, write it to the DB via `integrity.py --action write_review`, and emit one summary line in chat. Summary line format: `#<id> <Company> — <Role>  <score>%  <gate>  <resume>` (use `null  —  JD-fail` when the JD fetch failed). After the 12th review, append a totals line (`Wrote: <N> verdicts | <M> JD-fail | <K> errors`) and a `Next: [Company] — [Role]` pointer, then stop. If the queue empties before 12, emit the queue completion notice (see below) instead of `Next:`. The next user message triggers the next batch.
+Process 12 Pending reviews per response. For each row: apply the host-keyed fetch policy (see config.md "Web Pull Host Policy" and the JD-text section below), compute the full structured verdict, write it to the DB via `integrity.py --action write_review`, and emit one summary line in chat. Summary line format: `#<id> <Company> — <Role>  <score>%  <gate>  <resume>` plus a metadata-only chat suffix per config.md when applicable. After the 12th review, append a totals line (`Wrote: <N> verdicts | <M> metadata-only | <K> errors`) and a `Next: [Company] — [Role]` pointer, then stop. If the queue empties before 12, emit the queue completion notice (see below) instead of `Next:`. The next user message triggers the next batch.
 
 **Auto-continue mode — operator-driven via /loop. Status: untested in production.**
 End-to-end /loop firing has not been verified against this agent. Do not test on a live queue without supervision. The remaining text in this section is the design; treat any production use as a manual run until the loop path is verified.
@@ -68,13 +68,29 @@ The cap stop string is informational. /loop may not support stop-on-string match
 **Verdict payload — never abbreviated.**
 The full verdict (TL;DR, 4 component scores with recency multiplier, gate status with failures if any, met/unmet lists, soft reqs, hidden signals, seniority calibration, comp note, resume_used) is written to the DB via `write_review`. Every field in the payload is required — no skipping fields for "obvious" roles, short JDs, or queue length. integrity.py validates and rejects malformed payloads. Chat output is a single summary line per review (see cadence rule above); the full structured verdict lives in the DB and renders in the dashboard expand-row card.
 
-**JD text — fetch from canonical_link.**
-scan-staging.json rows contain metadata only. For each role, fetch the canonical_link and use the returned content as the scoring basis.
+**JD text — fetch policy is host-keyed.** See config.md "Web Pull Host Policy"
+for the authoritative deny / allow / try-once lists, redirect resolution rules,
+fallthrough triggers, and chat suffix taxonomy. Never redefine these lists here.
 
-Fetch tool selection:
-- **LinkedIn URLs (`linkedin.com`, `lnkd.in`) and any other auth-walled host:** use the connected Chrome MCP browser. Issue a single `mcp__Claude_in_Chrome__browser_batch` that navigates to the URL and reads the page text in one call. Never use sequential MCP browser actions — use `browser_batch` from the start. Do not use WebFetch for these URLs; it hits an unauthenticated session and returns the login wall.
-- **All other public URLs** (jobright.ai, ziprecruiter.com, hiring.cafe redirects, indeed.com redirects, company career pages with no auth wall): use WebFetch.
-- **If WebFetch returns the auth-wall fallback signature for a host you didn't expect to be auth-walled:** retry once via Chrome MCP `browser_batch` before giving up.
+scan-staging.json rows contain metadata. For each role:
+
+1. Resolve aggregator redirects on `canonical_link` to the final destination
+   host (per config.md redirect resolution rules).
+2. Look up the final host against config.md "Web Pull Host Policy".
+3. Apply the matching path:
+
+- **Deny list:** Do not fetch. Score metadata-only using staging fields +
+  `jd_excerpt`. Apply chat suffix `(metadata-only — auth-walled host)`.
+- **Allow list:** WebFetch the URL. If the fetch unexpectedly returns empty or
+  errors, score metadata-only with chat suffix `(metadata-only — fetch error)`.
+  Do not retry.
+- **Try-once:** WebFetch the URL once. Evaluate the response against config.md
+  fallthrough triggers. If any trigger fires, score metadata-only with chat
+  suffix `(metadata-only — try-once fallthrough)`. Do not retry. Do not call
+  Chrome MCP.
+
+Chrome MCP fetch paths are removed. Do not call any `mcp__Claude_in_Chrome__*`
+tool from the JD-fetch path under any condition.
 
 **Closed / expired posting detection.**
 After the fetch, before scoring, scan the page text for closed-posting indicators:
@@ -93,15 +109,40 @@ The chat summary line for these rows uses the format: `#<id> <Company> — <Role
 
 Skip to the next row. Do not generate a metadata-only verdict for closed postings — the row exits the queue cleanly via Pass with a closure note.
 
-**On fetch failure or empty content (NOT a closed-posting indicator — actual fetch error):** do not skip the row. Score conservatively from the staging metadata available (role title, company, comp range, location, source, staffing flag, inferred employer) and write the verdict via `write_review` so the row transitions Pending → Reviewed and exits the retry loop. When scoring metadata-only:
+**Metadata-only scoring path** (used for deny-list rows, try-once fallthrough
+rows, and allow-list fetch errors): do not skip the row. Score conservatively
+from staging metadata (title, company, comp, location, source, staffing flag,
+inferred employer) plus `jd_excerpt` when present, and write the verdict via
+`write_review` so the row transitions Pending → Reviewed and exits the queue.
+When scoring metadata-only:
 
-- Begin the `tldr` with `[JD FETCH FAILED — metadata-only review]` so it is visible in the dashboard card.
-- Make the first entry in `unmet` exactly: `Full JD content unavailable — verdict scored from staging metadata only; manual JD review recommended before applying.`
-- Begin `hidden_signals` with `[Metadata-only review]` to flag the limitation everywhere it surfaces.
-- Lower component scores 10–15 points relative to what the title and metadata suggest, to reflect verdict-confidence loss. Never fabricate met/unmet items beyond what the title and staging fields actually support.
-- Gate evaluation: if the title alone clearly violates a hard constraint (e.g., explicit Verizon hard-stop, comp floor, location), set `gate_status=FAIL` with that reason. Otherwise set `gate_status=PASS` so the metadata-only verdict isn't auto-capped — the metadata-only flag in tldr/unmet/hidden_signals carries the warning instead.
+- Begin the `tldr` with `[METADATA-ONLY REVIEW]` so it is visible in the
+  dashboard card.
+- Make the first entry in `unmet` exactly: `Full JD content unavailable —
+  verdict scored from staging metadata + email excerpt only; manual JD review
+  recommended before applying.`
+- Begin `hidden_signals` with `[Metadata-only review]` to flag the limitation
+  everywhere it surfaces.
+- If `jd_excerpt` is non-empty, use its content to inform met/unmet items — but
+  never extrapolate beyond what the excerpt and metadata explicitly support.
+  Treat the excerpt as facts in evidence; treat absence of a topic as silence,
+  not a deficiency.
+- Score adjustment:
+  - With non-empty `jd_excerpt`: lower component scores 5–10 points relative to
+    what title + metadata + excerpt suggest, reflecting partial-confidence loss.
+  - With empty `jd_excerpt`: lower component scores 10–15 points, reflecting
+    full-confidence loss.
+- Gate evaluation: if the title or excerpt clearly violates a hard constraint
+  (Verizon hard-stop, comp floor, location), set `gate_status=FAIL` with that
+  reason. Otherwise set `gate_status=PASS` so the metadata-only verdict isn't
+  auto-capped — the metadata-only flag in tldr/unmet/hidden_signals carries the
+  warning instead.
 
-The chat summary line for these rows uses the format: `#<id> <Company> — <Role>  <score>%  <gate>  <resume>  (metadata-only)`.
+The chat summary line for these rows uses the format
+`#<id> <Company> — <Role>  <score>%  <gate>  <resume>  <suffix>` where
+`<suffix>` is the chat suffix from config.md "Web Pull Host Policy"
+(`(metadata-only — auth-walled host)`, `(metadata-only — try-once fallthrough)`,
+or `(metadata-only — fetch error)`).
 
 If the user later supplies a real JD link, they can reset the row's status to Pending and the next run will re-score it with full content. Never fabricate JD content under any condition.
 

@@ -115,3 +115,91 @@ TPM, Technical Program Manager, Senior PM, Director of Programs
 
 **Track 2 — Automation resume (`resume-automation.md`):**
 Process Engineer, Business Process Analyst, Operations Automation, Workflow Engineer, Systems Operations Manager, Continuous Improvement Manager — roles centered on designing/optimizing operational workflows and automation systems
+
+---
+
+## Web Pull Host Policy
+
+Host-keyed policy controlling whether job-match attempts a web fetch for a row's
+`canonical_link`. This is the single source of truth — `job-match.md` and
+`email-scanner-v2.md` reference this section and must not redefine these lists.
+
+### Deny list — terminal metadata-only
+
+No fetch attempt. No retry. No Chrome MCP fallback. These hosts return auth
+walls, anti-bot challenges, or empty JS shells with no recoverable JD content.
+Score from staging metadata + `jd_excerpt`.
+
+- `linkedin.com`
+- `lnkd.in`
+- `ziprecruiter.com`
+- `indeed.com`
+- `cts.indeed.com`
+- `glassdoor.com`
+- Any host matching `*.myworkdayjobs.com`
+
+### Allow list — WebFetch primary
+
+WebFetch is the primary path. These hosts render JD content reliably to an
+unauthenticated request.
+
+- `greenhouse.io`
+- `job-boards.greenhouse.io`
+- `boards.greenhouse.io`
+- `jobs.lever.co`
+- `jobs.ashbyhq.com`
+- `apply.workable.com`
+- `jobright.ai`
+
+### Try-once list — single attempt, deterministic fallthrough
+
+One WebFetch attempt. Evaluate the response against the fallthrough rules below.
+If any trigger fires, treat the row as metadata-only. No retry. No Chrome MCP.
+
+- `*.icims.com`
+- `*.taleo.net`
+- `*.successfactors.com`
+- `*.smartrecruiters.com`
+- Any host not on the deny or allow lists (default to try-once)
+
+### Redirect resolution
+
+Aggregator redirect hosts must be resolved to the final destination host before
+applying policy:
+
+- `hiring.cafe` sendgrid links (`u52508838.ct.sendgrid.net/ls/click?...`)
+- Generic shorteners (`bit.ly`, `t.co`, etc.)
+
+After resolution, apply the deny / allow / try-once rule against the final host.
+
+### Fallthrough triggers (try-once hosts only)
+
+After the single WebFetch, treat the response as failed and route to
+metadata-only if any of the following:
+
+1. Response body text content (after HTML strip) is shorter than 800 characters.
+2. Response matches any login or challenge pattern (case-insensitive substring):
+   - `sign in to view`
+   - `please log in`
+   - `log in to continue`
+   - `create an account to view`
+   - `just a moment...`
+   - `please verify you are human`
+   - `enable javascript and cookies to continue`
+   - `attention required! | cloudflare`
+   - `access denied`
+   - `403 forbidden`
+3. Response is a JS shell with no rendered body content (presence of
+   `<div id="root"></div>` or `<div id="app"></div>` with no text inside).
+
+If any trigger fires, the row is metadata-only with chat suffix
+`(metadata-only — try-once fallthrough)`.
+
+### Chat suffix taxonomy
+
+| Outcome | Suffix |
+|---|---|
+| Full JD verdict | (none) |
+| Deny-list host, never attempted | `(metadata-only — auth-walled host)` |
+| Try-once host, fallthrough triggered | `(metadata-only — try-once fallthrough)` |
+| Allow-list host, fetch unexpectedly failed | `(metadata-only — fetch error)` |

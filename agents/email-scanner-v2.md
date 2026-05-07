@@ -29,7 +29,7 @@ If a subject matches both a digest pattern and a rejection pattern, treat as dig
 **Step 3:** For digest and ambiguous threads only, call `get_thread` one at a time. Immediately upon reading, extract job data into normalized rows and discard the raw body. Never hold more than one raw thread body in context simultaneously.
 
 Row schema:
-`source_email | company | role_title | comp | location | remote_status | canonical_link | staffing_agency (bool) | inferred_employer | notes`
+`source_email | company | role_title | comp | location | remote_status | canonical_link | jd_excerpt | staffing_agency (bool) | inferred_employer | notes`
 
 Immediately after extracting rows from each email, write those rows directly into
 `C:/Users/Garrison/career/scan-staging.json` in the same step. Do not wait until the end of
@@ -134,6 +134,50 @@ Do not store multiple URL variants of the same posting.
 | `donotreply@match.indeed.com` | `https://cts\.indeed\.com/v3/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+` | URL must be preceded by "View job:" label (case-insensitive, trimmed) |
 
 **Pattern lifecycle:** Aggregator URL patterns have a finite lifetime. Review `link_missing` and `link_ambiguous` flag counts weekly. A sudden rate increase for a single sender indicates a likely pattern change requiring an update to this table.
+
+**Step 4b:** JD excerpt extraction — capture descriptive body text from the role block when present.
+
+For each extracted role, after parsing metadata and resolving `canonical_link`,
+capture descriptive body text from the same role block into `jd_excerpt`. This
+is the email's own description of the role — typically a 1–3 sentence blurb the
+digest sender includes alongside the title and company. It is the only JD
+content available when the canonical link is on the deny list (per config.md
+"Web Pull Host Policy").
+
+Extraction rules:
+
+1. **Source:** text content within the role block only. Never pull from
+   adjacent role blocks, email headers, footers, or unrelated promotional text.
+2. **Length cap:** 600 characters. Truncate at the nearest sentence boundary at
+   or before 600 chars; do not split mid-word.
+3. **Strip:** HTML tags, URLs, image alt text, call-to-action labels
+   (`View job`, `Apply now`, `Easy Apply`, `Save`, `Save job`), and tracking IDs.
+4. **Whitespace:** collapse runs of whitespace to single spaces; strip
+   leading/trailing whitespace.
+5. **Empty case:** if the role block contains no descriptive body text beyond
+   title/company/comp/location, store `jd_excerpt` as empty string. Never
+   fabricate, summarize, or paraphrase content not present in the email.
+
+Per-sender expectations:
+
+| Sender | Excerpt typically present? |
+|---|---|
+| `jobalerts-noreply@linkedin.com` | Yes — short "About the job" snippet |
+| `donotreply@match.indeed.com` | Yes — 1–2 line snippet |
+| `ali@hiring.cafe` | Often — paragraph-length blurb |
+| `alerts@ziprecruiter.com` | No — expect empty |
+| `noreply@jobright.ai` | No — expect empty |
+
+`jd_excerpt` is not part of the `ingest` payload and is not persisted to
+`job-tracker.db` in this pass. It rides `scan-staging.json` through to job-match
+for scoring use only.
+
+**TODO (out of scope for this change):** consider persisting `jd_excerpt` to
+the row (via an `ingest` payload extension) in a later pass, so that re-scoring
+after a status reset has access to the same excerpt the original scoring used.
+Audit value as well — the excerpt that informed a metadata-only verdict would
+be recoverable from the DB rather than lost with staging. No implementation in
+this pass.
 
 **Step 5:** For any row where `staffing_agency = true`, record the inferred employer name if identifiable. Process normally through ingest — integrity.py handles staffing agency roles the same as direct postings. Do not hold for confirmation.
 
