@@ -11,6 +11,8 @@ A personal job search automation system built with Claude Code. It uses a multi-
 ├── CLAUDE.md                    # Session rules — loaded automatically by Claude Code
 ├── config.md                    # Shared config — file paths, score tiers, filter rules
 ├── integrity.py                 # Sole gatekeeper for job-tracker.db writes
+├── run-scan.py                  # Phase 1 entry — Gmail OAuth + thread fetch + scan dispatch
+├── email-scanner.py             # Per-sender deterministic parsers (LinkedIn, Indeed, Dice, ZipRecruiter, Built In, HiringCafe, JobRight) + staging writer
 ├── agents/
 │   ├── sera.md                  # Orchestrator — personality, routing, session state
 │   ├── job-match.md             # Job review — parse, score, DB write
@@ -24,9 +26,12 @@ A personal job search automation system built with Claude Code. It uses a multi-
 1. Launch Claude Code and say "scan my emails" or paste a job posting
 2. SERA reads `CLAUDE.md` and agent files automatically before routing
 3. Job reviews score against two resume tracks (PM and Automation), using a 4-component weighted matrix with a hard-requirement gate
-4. Email scans extract roles from digests, ingest through `integrity.py` filter gates, and auto-close rejections matched to existing applications
-5. All writes to `job-tracker.db` route through `integrity.py` — agents never touch the DB directly
-6. Dashboard reads both SQLite DBs and renders live analytics
+4. Email scans run in two phases:
+   - **Phase 1** (`run-scan.py` + `email-scanner.py`): script-driven, deterministic. Pulls threads under the configured Gmail label, runs per-sender regex parsers, writes `scan-staging.json` + a completion sentinel. No LLM in this phase — raw email bodies never reach an agent.
+   - **Phase 2** (agent, `email-scanner-v2.md`): reads staging, calls `integrity.py --action ingest_batch` to apply filter gates, relabels processed threads to `Job search 2026/Scanned` via Gmail API
+5. Rejections matched to existing applications auto-close via `integrity.py update_status`
+6. All writes to `job-tracker.db` route through `integrity.py` — agents never touch the DB directly
+7. Dashboard reads both SQLite DBs and renders live analytics
 
 ## Agent Design
 
@@ -63,7 +68,8 @@ The live dashboard is a FastAPI backend + Vite frontend (lives outside this repo
 - SQLite (`job-tracker.db`, `monitor.db`)
 - Python 3 + FastAPI (dashboard backend)
 - Vite + TypeScript (dashboard frontend)
-- Gmail MCP (email access — `search_threads`, `get_thread`, `list_labels`, `create_draft`, `create_label`, `list_drafts`)
+- Gmail API direct (bulk scan path: `run-scan.py` with OAuth `gmail.modify` scope, token cached at `token.json`)
+- Gmail MCP (ad-hoc queries only — `search_threads`, `get_thread`, `list_labels`, `create_draft`, `create_label`, `list_drafts`)
 
 ## Setup
 
@@ -71,6 +77,12 @@ The live dashboard is a FastAPI backend + Vite frontend (lives outside this repo
 2. Copy agent files to your Claude Code skill directory
 3. Update `<username>` paths in all files to match your machine
 4. Fill in `[COMP_FLOOR]`, `[HOME_LOCATION]`, `[PLACEMENT_RESTRICTIONS]` in config files
-5. Initialize `job-tracker.db` and `monitor.db` schemas (see `integrity.py` for the `reviewed_postings` table shape; monitor.db needs `event_log`, `quality_flags`, `scan_metrics`, `session_log`)
-6. Wire up the live dashboard separately if desired (FastAPI + Vite)
+5. **Gmail OAuth setup:**
+   - Create a Google Cloud project, enable the Gmail API
+   - Create an OAuth client (Desktop app), download as `credentials.json` to the project root
+   - Add scope `https://www.googleapis.com/auth/gmail.modify` (required for label modification)
+   - Create the Gmail label the scanner watches (default `Job search 2026`) and a child label `Job search 2026/Scanned`
+   - First `python run-scan.py` run will open a browser for consent and write `token.json`; the script then restricts the token file ACL to the current user
+6. Initialize `job-tracker.db` and `monitor.db` schemas (see `integrity.py` for the `reviewed_postings` table shape; monitor.db needs `event_log`, `quality_flags`, `scan_metrics`, `session_log`)
+7. Wire up the live dashboard separately if desired (FastAPI + Vite)
 ```
