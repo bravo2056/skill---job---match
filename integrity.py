@@ -270,7 +270,6 @@ def handle_age_pass(conn):
         FROM reviewed_postings
         WHERE status = 'Reviewed'
         AND julianday('now') - julianday(reviewed_at) > 10
-        AND julianday('now') - julianday(updated_at) > 10
     """)
     candidates = cur.fetchall()
 
@@ -359,9 +358,13 @@ def _comp_ceiling_fail(payload):
 
 
 def _commute_fail(payload):
+    # Scanner path emits remote_status ('Remote'|'Hybrid'|'Onsite'|''). Manual
+    # --action insert callers may instead set remote=0/1. Treat either signal.
+    remote_status = (payload.get('remote_status') or '').strip().lower()
     remote = payload.get('remote')
-    if remote is not None and remote == 0:
-        location = payload.get('location', '').lower()
+    is_onsite = remote_status == 'onsite' or remote == 0
+    if is_onsite:
+        location = (payload.get('location') or '').lower()
         if 'nj' not in location and 'new jersey' not in location and 'remote' not in location:
             return 'Non-remote, outside NJ'
     return None
@@ -376,6 +379,21 @@ def apply_filters(payload):
 
 
 def handle_ingest(payload, conn):
+    # Schema bridge: scan-staging.json (produced by email-scanner.py) uses
+    # descriptive long names (role_title, source_email, canonical_link).
+    # job-tracker.db uses short names (role, source, link). The aliases below
+    # let scan-staging.json rows be passed straight to ingest_batch with no
+    # transform step — see agents/email-scanner-v2.md Phase 2 Step 1.
+    # Extra staging-only fields (jd_excerpt, thread_id, staffing_agency
+    # transport metadata) are silently ignored by the SQL INSERT below.
+    # Do not remove this aliasing — it is the documented bridge.
+    if payload.get('role_title') and not payload.get('role'):
+        payload['role'] = payload['role_title']
+    if payload.get('source_email') and not payload.get('source'):
+        payload['source'] = payload['source_email']
+    if payload.get('canonical_link') and not payload.get('link'):
+        payload['link'] = payload['canonical_link']
+
     for field in ('company', 'role'):
         if not payload.get(field):
             return reject(f"Missing required field: {field}")
@@ -403,6 +421,32 @@ def handle_ingest(payload, conn):
 
     insert_payload = {**payload, 'status': status, 'notes': notes}
     return handle_insert(insert_payload, conn)
+
+
+def handle_ingest_batch(payload, conn):
+    """Loop ingest over a list of row payloads inside a single process.
+
+    Each row runs through the same handle_ingest path as --action ingest:
+    same filter gate, same dedup, same per-row commit, same result codes.
+    ensure_constraints(conn) and handle_age_pass(conn) are called once at
+    the top of main() — the same setup --action ingest gets — and are NOT
+    re-run per row.
+
+    Returns a list of per-row response objects in input order. Each item
+    has the identical {result, data, message} shape that --action ingest
+    returns. The list shape is the only difference from --action ingest:
+    single-row callers keep their single response object; batch callers
+    get a list. (See config.md SQLite Database section.)
+    """
+    if not isinstance(payload, list):
+        return [reject("ingest_batch payload must be a list of row objects")]
+    results = []
+    for item in payload:
+        if not isinstance(item, dict):
+            results.append(reject("item must be a dict"))
+            continue
+        results.append(handle_ingest(item, conn))
+    return results
 
 
 def handle_delete(payload, conn):
@@ -955,11 +999,17 @@ def handle_write_review(payload, conn):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--action',  required=True, choices=['insert','ingest','update_status','update_score','write_review','mark_for_rescore','audit','age_pass','resolve_id','bulk_resolve','delete','resolve_flag','write_flag','event_log_write','backfill_closed_at'])
+    parser.add_argument('--action',  required=True, choices=['insert','ingest','ingest_batch','update_status','update_score','write_review','mark_for_rescore','audit','age_pass','resolve_id','bulk_resolve','delete','resolve_flag','write_flag','event_log_write','backfill_closed_at'])
     parser.add_argument('--payload', default='{}')
+    parser.add_argument('--payload-file', default=None,
+                        help='Path to a file containing the JSON payload. Use this for ingest_batch or any payload too large for the CLI.')
     args = parser.parse_args()
 
-    payload = json.loads(args.payload)
+    if args.payload_file:
+        with open(args.payload_file, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    else:
+        payload = json.loads(args.payload)
 
     # monitor.db actions: do not open job-tracker.db
     if args.action in ('resolve_flag', 'write_flag', 'event_log_write'):
@@ -999,6 +1049,8 @@ def main():
             result = handle_age_pass(conn)
         elif args.action == 'ingest':
             result = handle_ingest(payload, conn)
+        elif args.action == 'ingest_batch':
+            result = handle_ingest_batch(payload, conn)
         elif args.action == 'resolve_id':
             result = handle_resolve_id(payload, conn)
         elif args.action == 'bulk_resolve':

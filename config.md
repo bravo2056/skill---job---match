@@ -24,11 +24,14 @@ directly. Do not write raw SQL. Do not import `sqlite3` for write operations.
 
 Common actions:
 - `python integrity.py --action ingest --payload '<json>'`
+- `python integrity.py --action ingest_batch --payload '[<json>, <json>, ...]'`
 - `python integrity.py --action insert --payload '<json>'`
 - `python integrity.py --action update_status --payload '{"id":N,"status":"Reviewed"}'`
 - `python integrity.py --action update_score --payload '{"id":N,"score_pct":N}'`
 - `python integrity.py --action resolve_id --payload '{"company":"X","role":"Y"}'`
 - `python integrity.py --action audit`
+
+Do not modify the response shape of `--action ingest`. Single-row callers continue to receive a single response object. Only `--action ingest_batch` returns a list.
 
 Status values: `Pending` | `Reviewed` | `Queued` | `Applied` | `Screening` | `Interview` | `Offer` | `Pass` | `Closed`
 
